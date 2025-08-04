@@ -10,7 +10,7 @@ export async function runLighthouse(url: string) {
             onlyCategories: ['performance', 'accessibility', 'seo', 'best-practices'],
         },
     };
-    const result = await lighthouse(url, flags, config);
+    const result = await lighthouse(url, { ...flags, output: ['json'] as const }, config);
     chrome.kill();
     if (!result) {
         throw new Error('Lighthouse did not return a result.');
