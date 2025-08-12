@@ -6,6 +6,8 @@ import fetch from 'node-fetch';
 import whois from 'whois-json';
 import { exec } from 'child_process';
 import { promisify } from 'util';
+// @ts-expect-error: psl types are not resolved correctly due to package.json "exports" field
+import psl from 'psl';
 
 const execAsync = promisify(exec);
 
@@ -237,37 +239,149 @@ export class ComprehensiveMonitor {
         }
     }
 
+    // npm install psl
+    // ...other imports (dns, tls, net, performance, fetch, execAsync, etc.)
+
     private async monitorDomainExpiration(url: string, result: MonitoringResult): Promise<void> {
         try {
-            const domain = new URL(url).hostname;
-            const whoisData = await whois(domain) as any;
+            const hostname = new URL(url).hostname;
 
-            const expiryFields = ['expiryDate', 'Registry Expiry Date', 'expires', 'Expiration Date', 'registrarRegistrationExpirationDate'];
-            let expiryDate: string | undefined;
+            // 1) Extract registered domain reliably (handles co.uk, etc. with psl)
+            const parsed = psl.parse(hostname);
+            let domain = typeof parsed === 'object' && parsed.domain ? parsed.domain : null;
+            if (!domain) {
+                // fallback: last two labels (best-effort)
+                const parts = hostname.split('.');
+                domain = parts.slice(-2).join('.');
+            }
 
-            for (const field of expiryFields) {
-                if (whoisData[field]) {
-                    expiryDate = whoisData[field];
-                    break;
+            let expiryStr: string | undefined;
+
+            // Helper: try parse date string into Date object (handles several formats)
+            const parseDateString = (s: string): Date | null => {
+                if (!s) return null;
+                s = s.trim().replace(/\s+GMT$/i, 'Z'); // normalize trailing "GMT"
+                const d = new Date(s);
+                if (!isNaN(d.getTime())) return d;
+
+                // dd-MMM-YYYY or d-MMM-YYYY (e.g., 20-Jul-2025)
+                const m = s.match(/(\d{1,2})[-\/ ]([A-Za-z]{3,9})[-\/ ](\d{4})/);
+                if (m) {
+                    const day = m[1].padStart(2, '0');
+                    const mon = m[2].slice(0, 3).toLowerCase();
+                    const months: Record<string, string> = {
+                        jan: '01', feb: '02', mar: '03', apr: '04', may: '05', jun: '06',
+                        jul: '07', aug: '08', sep: '09', oct: '10', nov: '11', dec: '12'
+                    };
+                    if (months[mon]) {
+                        const iso = `${m[3]}-${months[mon]}-${day}T00:00:00Z`;
+                        const d2 = new Date(iso);
+                        if (!isNaN(d2.getTime())) return d2;
+                    }
+                }
+
+                // last-resort Date.parse
+                const parsedMs = Date.parse(s);
+                return isNaN(parsedMs) ? null : new Date(parsedMs);
+            };
+
+            // 2) Try RDAP (structured JSON) first — usually the most reliable
+            try {
+                const rdapResp = await fetch(`https://rdap.org/domain/${domain}`, {
+                    headers: { 'User-Agent': 'Website-Monitor/1.0' },
+                    // node-fetch doesn't support timeout in options prior to v3; if needed wrap in AbortController
+                });
+
+                if (rdapResp.ok) {
+                    const rdapJson = await rdapResp.json().catch(() => null);
+                    if (rdapJson) {
+                        // RDAP typically contains an "events" array with eventAction and eventDate
+                        if (Array.isArray(rdapJson.events)) {
+                            const expEvent = rdapJson.events.find((e: any) =>
+                                typeof e.eventAction === 'string' &&
+                                /expir|expiration|expire/i.test(e.eventAction)
+                            );
+                            if (expEvent && expEvent.eventDate) {
+                                expiryStr = String(expEvent.eventDate).trim();
+                            }
+                        }
+
+                        // Some RDAP servers might embed the expiry in different places:
+                        if (!expiryStr && Array.isArray(rdapJson.nameservers)) {
+                            // nothing to do here, but left as placeholder in case of custom RDAP fields
+                        }
+                    }
+                }
+            } catch (err) {
+                // RDAP failed (network or service) -> fall through to whois fallback
+            }
+
+            // 3) If RDAP didn't find expiry, fallback to raw whois and search multiple patterns
+            if (!expiryStr) {
+                const { stdout, stderr } = await execAsync(`whois ${domain}`);
+                const whoisText = (stdout || '') + '\n' + (stderr || '');
+
+                const patterns = [
+                    /Registry Expiry Date:\s*(.+)/i,
+                    /Registrar Registration Expiration Date:\s*(.+)/i,
+                    /Expiration Date:\s*(.+)/i,
+                    /Expiry Date:\s*(.+)/i,
+                    /paid-till:\s*(.+)/i,
+                    /paid_till:\s*(.+)/i,
+                    /Expires On:\s*(.+)/i,
+                    /expires:\s*(.+)/i,
+                    /Renewal Date:\s*(.+)/i,
+                    /domain_datebilled_until:\s*(.+)/i,
+                    /Registry Expiry:\s*(.+)/i
+                ];
+
+                for (const re of patterns) {
+                    const m = whoisText.match(re);
+                    if (m && m[1]) {
+                        expiryStr = m[1].trim();
+                        break;
+                    }
+                }
+
+                // if still not found, try a looser search: any line containing "expir" or "expire"
+                if (!expiryStr) {
+                    const loose = whoisText.split(/\r?\n/).find(line => /expir|expire|expiry|expires/i.test(line));
+                    if (loose) {
+                        // take part after colon if exists
+                        const parts = loose.split(':');
+                        if (parts.length > 1) expiryStr = parts.slice(1).join(':').trim();
+                        else expiryStr = loose.trim();
+                    }
+                }
+
+                // For debugging (optional): include a short snippet of whois output in the error
+                if (!expiryStr) {
+                    result.domainExpiration = {
+                        status: 'error',
+                        error: 'Could not find expiry date in RDAP or WHOIS output; sample WHOIS start: ' + whoisText.slice(0, 800)
+                    };
+                    return;
                 }
             }
 
-            if (expiryDate) {
-                const expiry = new Date(expiryDate);
-                const now = new Date();
-                const daysUntilExpiry = Math.ceil((expiry.getTime() - now.getTime()) / (1000 * 60 * 60 * 24));
-
-                result.domainExpiration = {
-                    status: daysUntilExpiry > 0 ? (daysUntilExpiry > 30 ? 'valid' : 'expiring_soon') : 'expired',
-                    expiryDate: expiry.toISOString(),
-                    daysUntilExpiry
-                };
-            } else {
+            // 4) Parse the discovered expiry string into a Date
+            const expiryDate = parseDateString(expiryStr);
+            if (!expiryDate) {
                 result.domainExpiration = {
                     status: 'error',
-                    error: 'Could not determine domain expiration date'
+                    error: `Found expiry string but could not parse it: "${expiryStr}"`
                 };
+                return;
             }
+
+            const now = new Date();
+            const daysUntilExpiry = Math.ceil((expiryDate.getTime() - now.getTime()) / (1000 * 60 * 60 * 24));
+
+            result.domainExpiration = {
+                status: daysUntilExpiry > 0 ? (daysUntilExpiry > 30 ? 'valid' : 'expiring_soon') : 'expired',
+                expiryDate: expiryDate.toISOString(),
+                daysUntilExpiry
+            };
         } catch (error) {
             result.domainExpiration = {
                 status: 'error',
@@ -275,6 +389,7 @@ export class ComprehensiveMonitor {
             };
         }
     }
+
 
     private async monitorPorts(url: string, result: MonitoringResult): Promise<void> {
         const hostname = new URL(url).hostname;

@@ -9,17 +9,18 @@
     "lint": "next lint"
   },
   "dependencies": {
+    "googleapis": "^133.0.0",
     "lighthouse": "^12.8.0",
     "next": "15.4.5",
     "node-cron": "^3.0.3",
     "node-fetch": "^3.3.2",
     "nodemailer": "^6.9.8",
+    "psl": "^1.15.0",
     "puppeteer": "^24.15.0",
     "puppeteer-har": "^1.1.2",
     "react": "19.1.0",
     "react-dom": "19.1.0",
-    "whois-json": "^2.0.4",
-    "googleapis": "^133.0.0"
+    "whois-json": "^2.0.4"
   },
   "devDependencies": {
     "@eslint/eslintrc": "^3",
