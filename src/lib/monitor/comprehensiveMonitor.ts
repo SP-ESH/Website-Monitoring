@@ -286,35 +286,77 @@ export class ComprehensiveMonitor {
             };
 
             // 2) Try RDAP (structured JSON) first — usually the most reliable
+            // --- inside monitorDomainExpiration ---
+
+            // RDAP (structured JSON) — more reliable than plain WHOIS
             try {
                 const rdapResp = await fetch(`https://rdap.org/domain/${domain}`, {
-                    headers: { 'User-Agent': 'Website-Monitor/1.0' },
-                    // node-fetch doesn't support timeout in options prior to v3; if needed wrap in AbortController
+                    headers: { 'User-Agent': 'Website-Monitor/1.0' }
                 });
 
                 if (rdapResp.ok) {
-                    const rdapJson = await rdapResp.json().catch(() => null);
-                    if (rdapJson) {
-                        // RDAP typically contains an "events" array with eventAction and eventDate
-                        if (Array.isArray(rdapJson.events)) {
-                            const expEvent = rdapJson.events.find((e: any) =>
-                                typeof e.eventAction === 'string' &&
-                                /expir|expiration|expire/i.test(e.eventAction)
-                            );
-                            if (expEvent && expEvent.eventDate) {
-                                expiryStr = String(expEvent.eventDate).trim();
+                    // cast to 'any' so TypeScript won't complain about unknown properties
+                    const rdapJson: any = await rdapResp.json().catch(() => null);
+
+                    // Only proceed if rdapJson is an object
+                    if (rdapJson && typeof rdapJson === 'object') {
+                        // 1) Common RDAP layout: top-level "events" array
+                        const topEvents: any[] | null = Array.isArray(rdapJson.events) ? rdapJson.events : null;
+
+                        if (topEvents) {
+                            const expEvent = topEvents.find((e: any) => {
+                                const action = (e?.eventAction ?? e?.event_action ?? '').toString();
+                                return /expir|expiration|expire/i.test(action);
+                            });
+                            if (expEvent?.eventDate) expiryStr = String(expEvent.eventDate).trim();
+                        }
+
+                        // 2) Some RDAP responses store events under entities -> events
+                        if (!expiryStr && Array.isArray(rdapJson.entities)) {
+                            for (const ent of rdapJson.entities) {
+                                const entEvents: any[] | null = Array.isArray(ent?.events) ? ent.events : null;
+                                if (!entEvents) continue;
+                                const expEvent = entEvents.find((e: any) => {
+                                    const action = (e?.eventAction ?? e?.event_action ?? '').toString();
+                                    return /expir|expiration|expire/i.test(action);
+                                });
+                                if (expEvent?.eventDate) {
+                                    expiryStr = String(expEvent.eventDate).trim();
+                                    break;
+                                }
                             }
                         }
 
-                        // Some RDAP servers might embed the expiry in different places:
-                        if (!expiryStr && Array.isArray(rdapJson.nameservers)) {
-                            // nothing to do here, but left as placeholder in case of custom RDAP fields
+                        // 3) Defensive: sometimes RDAP uses different keys or embeds expiry in remarks/remarks[].description
+                        if (!expiryStr && Array.isArray(rdapJson.remarks)) {
+                            for (const r of rdapJson.remarks) {
+                                // remarks.description can be string[] or string
+                                const descriptions: string[] = Array.isArray(r?.description) ? r.description : (r?.description ? [String(r.description)] : []);
+                                for (const d of descriptions) {
+                                    if (/expiry|expire|expiration/i.test(d)) {
+                                        // try to pull a date-like substring
+                                        const m = d.match(/(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)|(\d{1,2}[-\/][A-Za-z]{3,9}[-\/]\d{4})|(\d{4}-\d{2}-\d{2})/);
+                                        if (m) { expiryStr = m[0]; break; }
+                                    }
+                                }
+                                if (expiryStr) break;
+                            }
+                        }
+
+                        // 4) If you still want to inspect nameservers safely (no errors if absent)
+                        if (Array.isArray(rdapJson.nameservers)) {
+                            // nameservers can be array of objects { ldhName: 'ns1...' } or strings
+                            const nsList = rdapJson.nameservers.map((n: any) => (n?.ldhName ?? n ?? '').toString()).filter(Boolean);
+                            // (we don't expect expiry here; this is just safe access)
+                            // console.log('nameservers:', nsList);
                         }
                     }
                 }
             } catch (err) {
-                // RDAP failed (network or service) -> fall through to whois fallback
+                // RDAP network / parse error — just continue to WHOIS fallback
+                // console.warn('RDAP failed', err);
             }
+
 
             // 3) If RDAP didn't find expiry, fallback to raw whois and search multiple patterns
             if (!expiryStr) {
